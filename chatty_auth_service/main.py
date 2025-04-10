@@ -1,5 +1,5 @@
-from fastapi import FastAPI, HTTPException, Request, Form, Depends, Cookie
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Request, Form, Depends
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
@@ -9,35 +9,38 @@ from uuid import uuid4
 import smtplib
 from email.mime.text import MIMEText
 from fastapi.security import OAuth2PasswordRequestForm
+from authlib.integrations.starlette_client import OAuth
 
 from chatty_auth_service.database import SessionLocal, engine, Base, get_db
 from chatty_auth_service.models import User
 from chatty_auth_service.utils.security import hash_password, verify_password
-from chatty_auth_service.utils.jwt import (
-    create_access_token,
-    create_refresh_token,
-    get_current_user,
-    verify_token,
-)
+from chatty_auth_service.utils.jwt import create_access_token, create_refresh_token, get_current_user
+from chatty_auth_service.settings import settings
 
 app = FastAPI()
-app.add_middleware(SessionMiddleware, secret_key="your-secret-key")
+app.add_middleware(SessionMiddleware, secret_key=settings.secret_key)
 
 templates = Jinja2Templates(directory="chatty_auth_service/templates")
 app.mount("/static", StaticFiles(directory="chatty_auth_service/static"), name="static")
 
 Base.metadata.create_all(bind=engine)
 
+oauth = OAuth()
+oauth.register(
+    name='google',
+    client_id=settings.client_id,
+    client_secret=settings.client_secret,
+    server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+    client_kwargs={'scope': 'openid email profile'},
+)
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
-
 @app.get("/register", response_class=HTMLResponse)
 def register_get(request: Request):
     return templates.TemplateResponse("register.html", {"request": request})
-
 
 @app.post("/register")
 def register_post(
@@ -66,7 +69,6 @@ def register_post(
     send_confirmation_email(email, confirmation_token)
     return templates.TemplateResponse("check_email.html", {"request": request})
 
-
 @app.get("/confirm")
 def confirm_email(token: str, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.confirmation_token == token).first()
@@ -78,16 +80,13 @@ def confirm_email(token: str, db: Session = Depends(get_db)):
     db.commit()
     return {"message": "Email confirmed. You can now log in."}
 
-
 @app.get("/me")
 def read_users_me(current_user: User = Depends(get_current_user)):
     return {"email": current_user.email, "id": current_user.id}
 
-
 @app.get("/login", response_class=HTMLResponse)
 def login_get(request: Request):
     return templates.TemplateResponse("login.html", {"request": request})
-
 
 @app.post("/login")
 def login_post(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
@@ -100,24 +99,66 @@ def login_post(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = D
 
     access_token = create_access_token(data={"sub": user.email})
     refresh_token = create_refresh_token(data={"sub": user.email})
-
     response = JSONResponse(content={"access_token": access_token, "token_type": "bearer"})
-    response.set_cookie(key="refresh_token", value=refresh_token, httponly=True)
+    response.set_cookie("refresh_token", refresh_token, httponly=True)
     return response
 
+@app.post("/logout")
+def logout():
+    response = JSONResponse(content={"message": "Logged out successfully"})
+    response.delete_cookie("refresh_token")
+    return response
 
 @app.post("/refresh")
-def refresh_token(refresh_token: str = Cookie(None)):
-    if refresh_token is None:
+def refresh_token(request: Request):
+    token = request.cookies.get("refresh_token")
+    if not token:
         raise HTTPException(status_code=401, detail="No refresh token provided")
 
     try:
-        email = verify_token(refresh_token)
-        new_access_token = create_access_token(data={"sub": email})
-        return {"access_token": new_access_token, "token_type": "bearer"}
+        user = get_current_user(token)
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
 
+    new_access_token = create_access_token(data={"sub": user.email})
+    return {"access_token": new_access_token, "token_type": "bearer"}
+
+# ===== Google OAuth2 integration =====
+
+@app.get("/login/google")
+async def login_via_google(request: Request):
+    redirect_uri = request.url_for("auth_google_callback")
+    return await oauth.google.authorize_redirect(request, redirect_uri)
+
+@app.get("/auth/google/callback")
+async def auth_google_callback(request: Request, db: Session = Depends(get_db)):
+    token = await oauth.google.authorize_access_token(request)
+    user_info = await oauth.google.parse_id_token(request, token)
+
+    if not user_info:
+        raise HTTPException(status_code=400, detail="Google auth failed")
+
+    email = user_info.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="Email not available in Google response")
+
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        user = User(
+            email=email,
+            password_hash="",  # Not used
+            is_active=True,
+            confirmation_token=None,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+    access_token = create_access_token(data={"sub": user.email})
+    refresh_token = create_refresh_token(data={"sub": user.email})
+    response = RedirectResponse(url="/")
+    response.set_cookie("refresh_token", refresh_token, httponly=True)
+    return response
 
 def send_confirmation_email(email: str, token: str):
     smtp_server = "smtp.gmail.com"
@@ -136,10 +177,3 @@ def send_confirmation_email(email: str, token: str):
         server.starttls()
         server.login(smtp_username, smtp_password)
         server.sendmail(smtp_username, [email], message.as_string())
-
-
-@app.post("/logout")
-def logout():
-    response = JSONResponse(content={"message": "Logged out successfully"})
-    response.delete_cookie("refresh_token")
-    return response
