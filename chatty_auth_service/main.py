@@ -1,71 +1,114 @@
-import bcrypt
-import smtplib
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Request, Form, Depends
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
-from database import get_db
-from models import User
-from schemas import UserCreate, UserLogin
-from prometheus_fastapi_instrumentator import Instrumentator
+from starlette.middleware.sessions import SessionMiddleware
+from pydantic import EmailStr
+from uuid import uuid4
+import smtplib
+from email.mime.text import MIMEText
 
-app = FastAPI(title="Chatty Auth Service")
-Instrumentator().instrument(app).expose(app)
+from chatty_auth_service.database import SessionLocal, engine, Base, get_db
+from chatty_auth_service.models import User
+from chatty_auth_service.utils.security import hash_password, verify_password
+
+app = FastAPI()
+app.add_middleware(SessionMiddleware, secret_key="your-secret-key")
+
+templates = Jinja2Templates(directory="chatty_auth_service/templates")
+app.mount("/static", StaticFiles(directory="chatty_auth_service/static"), name="static")
+
+Base.metadata.create_all(bind=engine)
 
 
-def hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+@app.get("/", response_class=HTMLResponse)
+def index(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
 
 
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+@app.get("/register", response_class=HTMLResponse)
+def register_get(request: Request):
+    return templates.TemplateResponse("register.html", {"request": request})
 
 
 @app.post("/register")
-async def register(user: UserCreate, db: Session = Depends(get_db)):
-    db_user = db.query(User).filter(User.username == user.username).first()
-    if db_user:
-        raise HTTPException(status_code=400, detail="Username already registered")
+def register_post(
+    request: Request,
+    email: EmailStr = Form(...),
+    password: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    existing_user = db.query(User).filter(User.email == email).first()
+    if existing_user:
+        raise HTTPException(status_code=400, detail="User already exists")
 
-    hashed_password = hash_password(user.password)
+    hashed_password = hash_password(password)
+    confirmation_token = str(uuid4())
+
     new_user = User(
-        username=user.username,
-        email=user.email,
-        hashed_password=hashed_password,
-        is_active=False
+        email=email,
+        password_hash=hashed_password,
+        is_active=False,
+        confirmation_token=confirmation_token,
     )
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
 
-    try:
-        with smtplib.SMTP("smtp.gmail.com", 587) as server:
-            server.starttls()
-            server.login("chatty@example.com", "password")
-            message = f"Subject: Подтверждение\n\nПодтвердите: http://localhost/auth/verify/{new_user.id}"
-            server.sendmail("chatty@example.com", user.email, message)
-    except Exception:
-        raise HTTPException(status_code=500, detail="Email error")
+    send_confirmation_email(email, confirmation_token)
+    return templates.TemplateResponse("check_email.html", {"request": request})
 
-    return {"message": f"User {user.username} registered, check your email"}
+
+@app.get("/confirm")
+def confirm_email(token: str, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.confirmation_token == token).first()
+    if not user:
+        raise HTTPException(status_code=400, detail="Invalid token")
+
+    user.is_active = True
+    user.confirmation_token = None
+    db.commit()
+    return {"message": "Email confirmed. You can now log in."}
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_get(request: Request):
+    return templates.TemplateResponse("login.html", {"request": request})
 
 
 @app.post("/login")
-async def login(user: UserLogin, db: Session = Depends(get_db)):
-    db_user = db.query(User).filter(User.username == user.username).first()
-    if not db_user or not verify_password(user.password, db_user.hashed_password):
+def login_post(
+    request: Request,
+    email: EmailStr = Form(...),
+    password: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    user = db.query(User).filter(User.email == email).first()
+    if not user or not verify_password(password, user.password_hash):
         raise HTTPException(status_code=400, detail="Invalid credentials")
-    if not db_user.is_active:
-        raise HTTPException(status_code=400, detail="Account not verified")
 
-    return {"message": "Login successful", "token": "fake-jwt-token", "user_id": db_user.id}
+    if not user.is_active:
+        raise HTTPException(status_code=400, detail="Email not confirmed")
+
+    # Здесь будет генерация JWT (временно возвращаем заглушку)
+    return {"access_token": "fake-jwt-token", "token_type": "bearer"}
 
 
-@app.get("/verify/{user_id}")
-async def verify_account(user_id: int, db: Session = Depends(get_db)):
-    db_user = db.query(User).filter(User.id == user_id).first()
-    if not db_user:
-        raise HTTPException(status_code=404, detail="User not found")
+def send_confirmation_email(email: str, token: str):
+    smtp_server = "smtp.gmail.com"
+    smtp_port = 587
+    smtp_username = "your_email@gmail.com"
+    smtp_password = "your_password"
 
-    db_user.is_active = True
-    db.commit()
+    subject = "Confirm your email"
+    body = f"Click the link to confirm your email: http://localhost:8000/confirm?token={token}"
+    message = MIMEText(body)
+    message["Subject"] = subject
+    message["From"] = smtp_username
+    message["To"] = email
 
-    return {"message": "Account verified"}
+    with smtplib.SMTP(smtp_server, smtp_port) as server:
+        server.starttls()
+        server.login(smtp_username, smtp_password)
+        server.sendmail(smtp_username, [email], message.as_string())
