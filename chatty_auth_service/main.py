@@ -8,10 +8,12 @@ from pydantic import EmailStr
 from uuid import uuid4
 import smtplib
 from email.mime.text import MIMEText
+from fastapi.security import OAuth2PasswordRequestForm
 
 from chatty_auth_service.database import SessionLocal, engine, Base, get_db
 from chatty_auth_service.models import User
 from chatty_auth_service.utils.security import hash_password, verify_password
+from chatty_auth_service.utils.jwt import create_access_token, get_current_user
 
 app = FastAPI()
 app.add_middleware(SessionMiddleware, secret_key="your-secret-key")
@@ -71,6 +73,9 @@ def confirm_email(token: str, db: Session = Depends(get_db)):
     db.commit()
     return {"message": "Email confirmed. You can now log in."}
 
+@app.get("/me")
+def read_users_me(current_user: User = Depends(get_current_user)):
+    return {"email": current_user.email, "id": current_user.id}
 
 @app.get("/login", response_class=HTMLResponse)
 def login_get(request: Request):
@@ -78,21 +83,16 @@ def login_get(request: Request):
 
 
 @app.post("/login")
-def login_post(
-    request: Request,
-    email: EmailStr = Form(...),
-    password: str = Form(...),
-    db: Session = Depends(get_db),
-):
-    user = db.query(User).filter(User.email == email).first()
-    if not user or not verify_password(password, user.password_hash):
+def login_post(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == form_data.username).first()
+    if not user or not verify_password(form_data.password, user.password_hash):
         raise HTTPException(status_code=400, detail="Invalid credentials")
 
     if not user.is_active:
         raise HTTPException(status_code=400, detail="Email not confirmed")
 
-    # Здесь будет генерация JWT (временно возвращаем заглушку)
-    return {"access_token": "fake-jwt-token", "token_type": "bearer"}
+    access_token = create_access_token(data={"sub": user.email})
+    return {"access_token": access_token, "token_type": "bearer"}
 
 
 def send_confirmation_email(email: str, token: str):
