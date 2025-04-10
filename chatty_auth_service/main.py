@@ -1,5 +1,5 @@
-from fastapi import FastAPI, HTTPException, Request, Form, Depends
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, Request, Form, Depends, Cookie
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
@@ -13,7 +13,12 @@ from fastapi.security import OAuth2PasswordRequestForm
 from chatty_auth_service.database import SessionLocal, engine, Base, get_db
 from chatty_auth_service.models import User
 from chatty_auth_service.utils.security import hash_password, verify_password
-from chatty_auth_service.utils.jwt import create_access_token, get_current_user
+from chatty_auth_service.utils.jwt import (
+    create_access_token,
+    create_refresh_token,
+    get_current_user,
+    verify_token,
+)
 
 app = FastAPI()
 app.add_middleware(SessionMiddleware, secret_key="your-secret-key")
@@ -73,9 +78,11 @@ def confirm_email(token: str, db: Session = Depends(get_db)):
     db.commit()
     return {"message": "Email confirmed. You can now log in."}
 
+
 @app.get("/me")
 def read_users_me(current_user: User = Depends(get_current_user)):
     return {"email": current_user.email, "id": current_user.id}
+
 
 @app.get("/login", response_class=HTMLResponse)
 def login_get(request: Request):
@@ -92,7 +99,24 @@ def login_post(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = D
         raise HTTPException(status_code=400, detail="Email not confirmed")
 
     access_token = create_access_token(data={"sub": user.email})
-    return {"access_token": access_token, "token_type": "bearer"}
+    refresh_token = create_refresh_token(data={"sub": user.email})
+
+    response = JSONResponse(content={"access_token": access_token, "token_type": "bearer"})
+    response.set_cookie(key="refresh_token", value=refresh_token, httponly=True)
+    return response
+
+
+@app.post("/refresh")
+def refresh_token(refresh_token: str = Cookie(None)):
+    if refresh_token is None:
+        raise HTTPException(status_code=401, detail="No refresh token provided")
+
+    try:
+        email = verify_token(refresh_token)
+        new_access_token = create_access_token(data={"sub": email})
+        return {"access_token": new_access_token, "token_type": "bearer"}
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
 
 
 def send_confirmation_email(email: str, token: str):
@@ -112,3 +136,10 @@ def send_confirmation_email(email: str, token: str):
         server.starttls()
         server.login(smtp_username, smtp_password)
         server.sendmail(smtp_username, [email], message.as_string())
+
+
+@app.post("/logout")
+def logout():
+    response = JSONResponse(content={"message": "Logged out successfully"})
+    response.delete_cookie("refresh_token")
+    return response
