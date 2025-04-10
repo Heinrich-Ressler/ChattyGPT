@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+sqlalchemy
+pydantic
+bcrypt
+python-jose
+pytest
+requests
+jinja2
+python-dotenv
